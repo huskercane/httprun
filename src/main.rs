@@ -139,7 +139,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             let mut resolved = (*req).clone();
             // Try to substitute variables (best-effort for dry run)
             if let Ok(url) = var_store.substitute(&resolved.url) {
-                resolved.url = url;
+                resolved.url = ensure_http_scheme(&url);
             }
             output::print_dry_run_request(i + 1, &resolved);
         }
@@ -154,7 +154,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
     for (i, req) in &requests {
         // Clone and resolve variables
         let mut resolved = (*req).clone();
-        resolved.url = var_store.substitute(&resolved.url)?;
+        let resolved_url = var_store.substitute(&resolved.url)?;
+        resolved.url = ensure_http_scheme(&resolved_url);
 
         // Substitute variables in headers
         for header in &mut resolved.headers {
@@ -228,4 +229,88 @@ fn run(cli: Cli) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn ensure_http_scheme(url: &str) -> String {
+    let trimmed = url.trim();
+    if has_url_scheme(trimmed) {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed)
+    }
+}
+
+fn has_url_scheme(url: &str) -> bool {
+    let Some(idx) = url.find("://") else {
+        return false;
+    };
+    if idx == 0 {
+        return false;
+    }
+    let scheme = &url[..idx];
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let mut has_plus_or_dash = false;
+    let mut has_dot = false;
+    for c in chars {
+        match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => {}
+            '+' | '-' => {
+                has_plus_or_dash = true;
+            }
+            '.' => {
+                has_dot = true;
+            }
+            _ => return false,
+        }
+    }
+    // Heuristic: treat dotted, domain-like prefixes without + or - as missing schemes.
+    !(has_dot && !has_plus_or_dash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_http_scheme, has_url_scheme};
+
+    #[test]
+    fn has_url_scheme_accepts_valid_schemes() {
+        assert!(has_url_scheme("http://example.com"));
+        assert!(has_url_scheme("https://example.com"));
+        assert!(has_url_scheme("ftp://example.com"));
+        assert!(has_url_scheme("custom+v1.2-scheme://example.com"));
+    }
+
+    #[test]
+    fn has_url_scheme_rejects_invalid_or_missing_schemes() {
+        assert!(!has_url_scheme("://example.com"));
+        assert!(!has_url_scheme("1http://example.com"));
+        assert!(!has_url_scheme("http:/example.com"));
+        assert!(!has_url_scheme("example.com/path"));
+        assert!(!has_url_scheme("example.com://path"));
+    }
+
+    #[test]
+    fn ensure_http_scheme_only_prepends_when_missing() {
+        assert_eq!(
+            ensure_http_scheme("https://example.com"),
+            "https://example.com"
+        );
+        assert_eq!(
+            ensure_http_scheme("ftp://example.com"),
+            "ftp://example.com"
+        );
+        assert_eq!(
+            ensure_http_scheme("example.com/path"),
+            "https://example.com/path"
+        );
+        assert_eq!(
+            ensure_http_scheme("  example.com  "),
+            "https://example.com"
+        );
+    }
 }

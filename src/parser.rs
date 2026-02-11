@@ -335,3 +335,51 @@ pub fn parse_http_file(content: &str) -> Result<ParseResult, AppError> {
         in_place_vars,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_http_file, HttpMethod};
+
+    #[test]
+    fn parses_request_with_body_and_handler() {
+        let content = r#"
+@token = abc123
+
+### create item
+POST https://example.com/items
+Content-Type: application/json
+X-Trace: 123
+
+{
+  "name": "widget"
+}
+
+> {%
+  client.test("status is 200", function() {
+    client.assert(response.status === 200);
+  });
+%}
+"#;
+
+        let parsed = parse_http_file(content).expect("parse should succeed");
+        assert_eq!(parsed.in_place_vars, vec![("token".to_string(), "abc123".to_string())]);
+        assert_eq!(parsed.requests.len(), 1);
+
+        let req = &parsed.requests[0];
+        assert_eq!(req.name.as_deref(), Some("create item"));
+        assert_eq!(req.method, HttpMethod::Post);
+        assert_eq!(req.url, "https://example.com/items");
+        assert_eq!(req.headers.len(), 2);
+        assert_eq!(req.headers[0].name, "Content-Type");
+        assert_eq!(req.headers[0].value, "application/json");
+        assert_eq!(req.headers[1].name, "X-Trace");
+        assert_eq!(req.headers[1].value, "123");
+        assert_eq!(
+            req.body.as_deref(),
+            Some("{\n  \"name\": \"widget\"\n}")
+        );
+        let handler = req.response_handler.as_deref().expect("handler present");
+        assert!(handler.contains("client.test(\"status is 200\""));
+        assert!(handler.contains("client.assert(response.status === 200);"));
+    }
+}
