@@ -100,7 +100,7 @@ mod tests {
         let script2 = r#"
             client.test("Global persists", function() {
                 var expected = client.global.get("totalElements");
-                client.assert(expected === "12", "expected 12 but got " + expected);
+                client.assert(expected === 12, "expected 12 but got " + expected);
             });
         "#;
         let result2 = execute_handler(script2, &resp, &result1.global_vars).unwrap();
@@ -122,5 +122,44 @@ mod tests {
         let resp = dummy_response();
         let result = execute_handler(script, &resp, &HashMap::new()).unwrap();
         assert!(result.test_results.iter().all(|r| r.passed));
+    }
+
+    #[test]
+    fn global_get_preserves_types() {
+        let script = r#"
+            client.global.set("num", 42);
+            client.global.set("float", 3.14);
+            client.global.set("str", "hello");
+            client.global.set("t", true);
+            client.global.set("f", false);
+
+            client.test("Number preserved", function() {
+                var v = client.global.get("num");
+                client.assert(v === 42, "expected number 42, got " + typeof v + " " + v);
+            });
+            client.test("Float preserved", function() {
+                var v = client.global.get("float");
+                client.assert(v === 3.14, "expected 3.14, got " + typeof v + " " + v);
+            });
+            client.test("String preserved", function() {
+                var v = client.global.get("str");
+                client.assert(v === "hello", "expected string hello, got " + typeof v + " " + v);
+            });
+            client.test("Boolean true preserved", function() {
+                var v = client.global.get("t");
+                client.assert(v === true, "expected true, got " + typeof v + " " + v);
+            });
+            client.test("Boolean false preserved", function() {
+                var v = client.global.get("f");
+                client.assert(v === false, "expected false, got " + typeof v + " " + v);
+            });
+        "#;
+        let resp = dummy_response();
+        let result = execute_handler(script, &resp, &HashMap::new()).unwrap();
+        assert!(
+            result.test_results.iter().all(|r| r.passed),
+            "test failed: {:?}",
+            result.test_results,
+        );
     }
 }

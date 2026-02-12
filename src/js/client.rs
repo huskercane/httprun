@@ -185,7 +185,19 @@ fn build_global_object(
 
             let state = shared_get.borrow();
             match state.global_vars.get(&name) {
-                Some(v) => Ok(JsValue::from(js_string!(v.clone()))),
+                Some(v) => {
+                    // Try to return numbers as numbers to preserve type
+                    // through set/get roundtrip (matches IntelliJ behavior)
+                    if let Ok(n) = v.parse::<f64>() {
+                        Ok(JsValue::from(n))
+                    } else if v == "true" {
+                        Ok(JsValue::from(true))
+                    } else if v == "false" {
+                        Ok(JsValue::from(false))
+                    } else {
+                        Ok(JsValue::from(js_string!(v.clone())))
+                    }
+                }
                 None => Ok(JsValue::undefined()),
             }
         })
