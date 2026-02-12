@@ -184,7 +184,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
                 // Run response handler if present
                 if let Some(handler) = &resolved.response_handler {
-                    match js::execute_handler(handler, &response) {
+                    match js::execute_handler(handler, &response, var_store.globals()) {
                         Ok(result) => {
                             // Merge global variables
                             var_store.merge_globals(&result.global_vars);

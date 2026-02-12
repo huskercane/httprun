@@ -24,6 +24,10 @@ impl VariableStore {
         }
     }
 
+    pub fn globals(&self) -> &HashMap<String, String> {
+        &self.global_vars
+    }
+
     pub fn merge_globals(&mut self, globals: &HashMap<String, String>) {
         for (k, v) in globals {
             self.global_vars.insert(k.clone(), v.clone());

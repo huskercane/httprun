@@ -26,9 +26,13 @@ pub struct HandlerResult {
 pub fn execute_handler(
     script: &str,
     http_response: &HttpResponse,
+    existing_globals: &HashMap<String, String>,
 ) -> Result<HandlerResult, AppError> {
     let mut context = Context::default();
-    let shared_state = Rc::new(RefCell::new(JsSharedState::default()));
+    let shared_state = Rc::new(RefCell::new(JsSharedState {
+        global_vars: existing_globals.clone(),
+        ..Default::default()
+    }));
 
     // Build and register `response` global
     let response_obj = build_response_object(http_response, &mut context)
@@ -63,4 +67,60 @@ pub fn execute_handler(
         test_results: state.test_results.clone(),
         log_output: state.log_output.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{ContentType, HttpResponse};
+
+    fn dummy_response() -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body_raw: r#"{"totalElements": 12}"#.to_string(),
+            body_json: serde_json::from_str(r#"{"totalElements": 12}"#).ok(),
+            content_type: Some(ContentType {
+                mime_type: "application/json".to_string(),
+                charset: None,
+            }),
+            elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn global_vars_persist_across_handler_calls() {
+        // First handler sets a global variable
+        let script1 = r#"client.global.set("totalElements", response.body.totalElements);"#;
+        let resp = dummy_response();
+        let result1 = execute_handler(script1, &resp, &HashMap::new()).unwrap();
+        assert_eq!(result1.global_vars.get("totalElements").unwrap(), "12");
+
+        // Second handler reads the global variable set by the first
+        let script2 = r#"
+            client.test("Global persists", function() {
+                var expected = client.global.get("totalElements");
+                client.assert(expected === "12", "expected 12 but got " + expected);
+            });
+        "#;
+        let result2 = execute_handler(script2, &resp, &result1.global_vars).unwrap();
+        assert!(
+            result2.test_results.iter().all(|r| r.passed),
+            "test failed: {:?}",
+            result2.test_results,
+        );
+    }
+
+    #[test]
+    fn global_get_returns_undefined_when_empty() {
+        let script = r#"
+            client.test("Missing global is undefined", function() {
+                var val = client.global.get("nonexistent");
+                client.assert(val === undefined, "expected undefined");
+            });
+        "#;
+        let resp = dummy_response();
+        let result = execute_handler(script, &resp, &HashMap::new()).unwrap();
+        assert!(result.test_results.iter().all(|r| r.passed));
+    }
 }
