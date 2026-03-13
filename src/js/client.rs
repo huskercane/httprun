@@ -159,6 +159,14 @@ fn build_global_object(
                 } else {
                     format!("{n}")
                 }
+            } else if value.is_string() {
+                // For strings, prefix with a marker to distinguish from numbers/booleans
+                // Or better, don't auto-parse in `get` if we want to be safe.
+                // But the instructions say "preserve type through set/get roundtrip".
+                // Let's use a simple JSON-like approach for storage.
+                format!("\"{}\"", value.to_string(ctx)?.to_std_string_escaped())
+            } else if value.is_boolean() {
+                format!("{}", value.to_boolean())
             } else {
                 value.to_string(ctx)?.to_std_string_escaped()
             };
@@ -186,9 +194,10 @@ fn build_global_object(
             let state = shared_get.borrow();
             match state.global_vars.get(&name) {
                 Some(v) => {
-                    // Try to return numbers as numbers to preserve type
-                    // through set/get roundtrip (matches IntelliJ behavior)
-                    if let Ok(n) = v.parse::<f64>() {
+                    if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+                        // It's a stored string
+                        Ok(JsValue::from(js_string!(&v[1..v.len() - 1])))
+                    } else if let Ok(n) = v.parse::<f64>() {
                         Ok(JsValue::from(n))
                     } else if v == "true" {
                         Ok(JsValue::from(true))
