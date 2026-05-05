@@ -56,8 +56,9 @@ httprun <file.http> [OPTIONS]
 | `--env-file <path>` | Path to the environment file (default: `http-client.env.json`) |
 | `--name <name>` | Run a single request by name (case-insensitive substring match) |
 | `--index <n>` | Run a single request by 1-based index |
-| `-v`, `--verbose` | Show full request/response headers and body |
+| `-v`, `--verbose` | Show a curl-style trace of each request and response |
 | `--dry-run` | Parse and display requests without executing them |
+| `--curl` | Print a copy-pasteable `curl` command for each request |
 
 ### Examples
 
@@ -77,8 +78,48 @@ httprun api.http --index 2
 # Preview without executing
 httprun api.http --env staging --dry-run
 
-# Verbose output with full headers
+# curl-style trace (sent / received headers, body, timing)
 httprun api.http --env dev -v
+
+# Print copy-pasteable curl commands instead of running
+httprun api.http --env dev --dry-run --curl
+
+# Run and also show the equivalent curl command for each request
+httprun api.http --env dev --curl
+```
+
+### Debug output
+
+Two complementary flags for inspecting what gets sent on the wire:
+
+- `-v` / `--verbose` — live trace using curl's conventions: `*` for connection / timing meta, `>` for sent bytes, `<` for received bytes. Useful when you want to see exactly what httprun sent and what came back.
+- `--curl` — emits a `curl` command line that reproduces each request, with proper shell quoting. Useful when you want to copy-paste a request into a terminal, share it in a bug report, or hand it off to another tool. Combine with `--dry-run` to print without sending.
+
+Example `-v` output:
+
+```
+[1] get example
+  GET https://httpbin.org/get
+  * Connected to httpbin.org
+  > GET /get HTTP/1.1
+  > Accept: application/json
+  → 200 (170ms)
+  < HTTP/1.1 200
+  < content-type: application/json
+  < 
+  < {"args": {}, ...}
+  * Total: 170ms
+```
+
+Example `--curl --dry-run` output:
+
+```
+[2] post example
+  POST https://api.example.com/users
+  $ curl 'https://api.example.com/users' \
+  $   -X POST \
+  $   -H 'Content-Type: application/json' \
+  $   --data-raw '{"name":"alice"}'
 ```
 
 ## HTTP File Format

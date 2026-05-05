@@ -77,6 +77,7 @@ mod tests {
     fn dummy_response() -> HttpResponse {
         HttpResponse {
             status: 200,
+            http_version: "HTTP/1.1".to_string(),
             headers: HashMap::new(),
             body_raw: r#"{"totalElements": 12}"#.to_string(),
             body_json: serde_json::from_str(r#"{"totalElements": 12}"#).ok(),

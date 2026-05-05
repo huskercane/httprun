@@ -16,11 +16,27 @@ pub struct ContentType {
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
+    pub http_version: String,
     pub headers: HashMap<String, Vec<String>>,
     pub body_raw: String,
     pub body_json: Option<serde_json::Value>,
     pub content_type: Option<ContentType>,
     pub elapsed_ms: u128,
+}
+
+/// Render `reqwest::Version` (re-exported `http::Version`) as the canonical
+/// `HTTP/x.y` string. `Version`'s `Debug` impl produces names like `HTTP_11`,
+/// which is not what curl-style output expects.
+fn format_http_version(v: reqwest::Version) -> String {
+    match v {
+        reqwest::Version::HTTP_09 => "HTTP/0.9",
+        reqwest::Version::HTTP_10 => "HTTP/1.0",
+        reqwest::Version::HTTP_11 => "HTTP/1.1",
+        reqwest::Version::HTTP_2 => "HTTP/2.0",
+        reqwest::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/?",
+    }
+    .to_string()
 }
 
 pub fn execute_request(request: &ParsedRequest) -> Result<HttpResponse, AppError> {
@@ -62,6 +78,7 @@ pub fn execute_request(request: &ParsedRequest) -> Result<HttpResponse, AppError
     let elapsed_ms = start.elapsed().as_millis();
 
     let status = response.status().as_u16();
+    let http_version = format_http_version(response.version());
 
     // Collect headers
     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
@@ -95,6 +112,7 @@ pub fn execute_request(request: &ParsedRequest) -> Result<HttpResponse, AppError
 
     Ok(HttpResponse {
         status,
+        http_version,
         headers,
         body_raw,
         body_json,

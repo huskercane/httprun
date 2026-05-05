@@ -1,3 +1,4 @@
+mod curl;
 mod env;
 mod error;
 mod http;
@@ -36,13 +37,17 @@ struct Cli {
     #[arg(long)]
     index: Option<usize>,
 
-    /// Show full request/response details
+    /// Show full request/response details (curl-style trace)
     #[arg(short, long)]
     verbose: bool,
 
     /// Parse and display without executing
     #[arg(long)]
     dry_run: bool,
+
+    /// Print a copy-pasteable curl command for each request
+    #[arg(long)]
+    curl: bool,
 }
 
 fn main() {
@@ -136,12 +141,11 @@ fn run(cli: Cli) -> Result<(), AppError> {
             cli.file.display()
         );
         for (i, req) in &requests {
-            let mut resolved = (*req).clone();
-            // Try to substitute variables (best-effort for dry run)
-            if let Ok(url) = var_store.substitute(&resolved.url) {
-                resolved.url = ensure_http_scheme(&url);
-            }
+            let resolved = resolve_request_best_effort(req, &var_store);
             output::print_dry_run_request(i + 1, &resolved);
+            if cli.curl {
+                output::print_curl_command(&curl::to_curl_command(&resolved));
+            }
         }
         return Ok(());
     }
@@ -152,25 +156,16 @@ fn run(cli: Cli) -> Result<(), AppError> {
     let mut error_count = 0usize;
 
     for (i, req) in &requests {
-        // Clone and resolve variables
-        let mut resolved = (*req).clone();
-        let resolved_url = var_store.substitute(&resolved.url)?;
-        resolved.url = ensure_http_scheme(&resolved_url);
-
-        // Substitute variables in headers
-        for header in &mut resolved.headers {
-            header.value = var_store.substitute(&header.value)?;
-        }
-
-        // Substitute variables in body
-        if let Some(body) = &resolved.body {
-            resolved.body = Some(var_store.substitute(body)?);
-        }
+        let resolved = resolve_request(req, &var_store)?;
 
         output::print_request_header(i + 1, &resolved);
 
+        if cli.curl {
+            output::print_curl_command(&curl::to_curl_command(&resolved));
+        }
+
         if cli.verbose {
-            output::print_verbose_request(&resolved);
+            output::print_trace_request(&resolved);
         }
 
         // Execute HTTP request
@@ -179,7 +174,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
                 output::print_response_status(&response);
 
                 if cli.verbose {
-                    output::print_verbose_response(&response);
+                    output::print_trace_response(&response);
                 }
 
                 // Run response handler if present
@@ -231,6 +226,51 @@ fn run(cli: Cli) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Substitute `{{var}}` references in a request's URL, headers, and body.
+/// Errors if any referenced variable is undefined.
+fn resolve_request(
+    req: &parser::ParsedRequest,
+    vars: &VariableStore,
+) -> Result<parser::ParsedRequest, AppError> {
+    let mut resolved = req.clone();
+    resolved.url = ensure_http_scheme(&vars.substitute(&resolved.url)?);
+    for header in &mut resolved.headers {
+        header.value = vars.substitute(&header.value)?;
+    }
+    if let Some(body) = &resolved.body {
+        resolved.body = Some(vars.substitute(body)?);
+    }
+    Ok(resolved)
+}
+
+/// Best-effort variant of `resolve_request` for `--dry-run`: leaves any
+/// reference whose variable is undefined as the original `{{var}}` literal,
+/// so users can still inspect requests that depend on globals set by earlier
+/// response handlers. The URL's scheme is only normalized when substitution
+/// fully succeeded — otherwise the original text is preserved verbatim.
+fn resolve_request_best_effort(
+    req: &parser::ParsedRequest,
+    vars: &VariableStore,
+) -> parser::ParsedRequest {
+    let sub = |s: &str| vars.substitute(s).unwrap_or_else(|_| s.to_string());
+    let mut resolved = req.clone();
+    let url_substituted = sub(&resolved.url);
+    // Only normalize the scheme when the URL is fully resolved — otherwise
+    // we'd mangle literals like `{{host}}/users` into `https://{{host}}/users`.
+    resolved.url = if url_substituted.contains("{{") {
+        url_substituted
+    } else {
+        ensure_http_scheme(&url_substituted)
+    };
+    for header in &mut resolved.headers {
+        header.value = sub(&header.value);
+    }
+    if let Some(body) = &resolved.body {
+        resolved.body = Some(sub(body));
+    }
+    resolved
+}
+
 fn ensure_http_scheme(url: &str) -> String {
     let trimmed = url.trim();
     if has_url_scheme(trimmed) {
@@ -275,7 +315,49 @@ fn has_url_scheme(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_http_scheme, has_url_scheme};
+    use super::{ensure_http_scheme, has_url_scheme, resolve_request_best_effort};
+    use crate::parser::{Header, HttpMethod, ParsedRequest};
+    use crate::variable::VariableStore;
+    use std::collections::HashMap;
+
+    #[test]
+    fn dry_run_resolution_keeps_undefined_vars_as_literals() {
+        let store = VariableStore::new(HashMap::new());
+        let req = ParsedRequest {
+            name: None,
+            method: HttpMethod::Get,
+            url: "{{host}}/users".to_string(),
+            headers: vec![Header {
+                name: "Authorization".to_string(),
+                value: "Bearer {{authToken}}".to_string(),
+            }],
+            body: None,
+            response_handler: None,
+            line_number: 1,
+        };
+        let resolved = resolve_request_best_effort(&req, &store);
+        // URL stays exactly as written — no scheme injection when substitution failed.
+        assert_eq!(resolved.url, "{{host}}/users");
+        assert_eq!(resolved.headers[0].value, "Bearer {{authToken}}");
+    }
+
+    #[test]
+    fn dry_run_resolution_normalizes_scheme_when_fully_resolved() {
+        let mut env = HashMap::new();
+        env.insert("host".to_string(), "api.example.com".to_string());
+        let store = VariableStore::new(env);
+        let req = ParsedRequest {
+            name: None,
+            method: HttpMethod::Get,
+            url: "{{host}}/users".to_string(),
+            headers: Vec::new(),
+            body: None,
+            response_handler: None,
+            line_number: 1,
+        };
+        let resolved = resolve_request_best_effort(&req, &store);
+        assert_eq!(resolved.url, "https://api.example.com/users");
+    }
 
     #[test]
     fn has_url_scheme_accepts_valid_schemes() {
