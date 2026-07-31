@@ -5,7 +5,15 @@
       "Bash(cargo update:*)",
       "Bash(cargo check:*)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Read(//home/rohitsi/work/code/k6-rs/**)",
+      "Bash(/home/rohitsi/work/code/httprun/target/debug/httprun /tmp/smoke.http --verbose --index 1)",
+      "Bash(/home/rohitsi/work/code/httprun/target/debug/httprun /tmp/smoke2.http --dry-run --curl)",
+      "Bash(echo \"EXIT $?\")",
+      "Bash(/home/rohitsi/work/code/httprun/target/debug/httprun /tmp/smoke2.http --index 2 -v)",
+      "Bash(/home/rohitsi/work/code/httprun/target/debug/httprun /tmp/smoke3.http -v)",
+      "Read(//home/rohitsi/.cargo/registry/**)",
+      "Read(//home/rohitsi/.cargo/registry/cache/**)"
     ]
   }
 }

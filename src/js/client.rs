@@ -1,20 +1,19 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use boa_engine::{
-    Context, JsResult, JsValue, NativeFunction,
-    js_string,
-    object::ObjectInitializer,
-    property::Attribute,
+    Context, JsNativeError, JsResult, JsValue, NativeFunction, js_string,
+    object::ObjectInitializer, property::Attribute,
 };
 
+use crate::js::response::json_to_js;
 use crate::js::runtime::TestResult;
+use crate::variable::GlobalVars;
 
 /// Shared state between Rust and JS for the `client` object.
 #[derive(Debug, Default)]
 pub struct JsSharedState {
-    pub global_vars: HashMap<String, String>,
+    pub global_vars: GlobalVars,
     pub test_results: Vec<TestResult>,
     pub log_output: Vec<String>,
 }
@@ -40,10 +39,7 @@ pub fn build_client_object(
                 .to_string(ctx)?
                 .to_std_string_escaped();
 
-            let callback = args
-                .get(1)
-                .cloned()
-                .unwrap_or(JsValue::undefined());
+            let callback = args.get(1).cloned().unwrap_or(JsValue::undefined());
 
             if let Some(cb) = callback.as_callable() {
                 let pre_len = shared_test.borrow().test_results.len();
@@ -51,7 +47,8 @@ pub fn build_client_object(
                 match cb.call(&JsValue::undefined(), &[], ctx) {
                     Ok(_) => {
                         let state = shared_test.borrow();
-                        let had_failure = state.test_results.iter().skip(pre_len).any(|r| !r.passed);
+                        let had_failure =
+                            state.test_results.iter().skip(pre_len).any(|r| !r.passed);
 
                         if !had_failure {
                             drop(state);
@@ -147,34 +144,10 @@ fn build_global_object(
                 .to_string(ctx)?
                 .to_std_string_escaped();
 
-            let value = args
-                .get(1)
-                .cloned()
-                .unwrap_or(JsValue::undefined());
+            let value = args.get(1).cloned().unwrap_or(JsValue::undefined());
+            let stored = js_to_json(&value, ctx)?;
 
-            let value_str = if value.is_number() {
-                let n = value.to_number(ctx)?;
-                if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
-                    format!("{}", n as i64)
-                } else {
-                    format!("{n}")
-                }
-            } else if value.is_string() {
-                // For strings, prefix with a marker to distinguish from numbers/booleans
-                // Or better, don't auto-parse in `get` if we want to be safe.
-                // But the instructions say "preserve type through set/get roundtrip".
-                // Let's use a simple JSON-like approach for storage.
-                format!("\"{}\"", value.to_string(ctx)?.to_std_string_escaped())
-            } else if value.is_boolean() {
-                format!("{}", value.to_boolean())
-            } else {
-                value.to_string(ctx)?.to_std_string_escaped()
-            };
-
-            shared_set
-                .borrow_mut()
-                .global_vars
-                .insert(name, value_str);
+            shared_set.borrow_mut().global_vars.insert(name, stored);
 
             Ok(JsValue::undefined())
         })
@@ -191,22 +164,9 @@ fn build_global_object(
                 .to_string(ctx)?
                 .to_std_string_escaped();
 
-            let state = shared_get.borrow();
-            match state.global_vars.get(&name) {
-                Some(v) => {
-                    if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
-                        // It's a stored string
-                        Ok(JsValue::from(js_string!(&v[1..v.len() - 1])))
-                    } else if let Ok(n) = v.parse::<f64>() {
-                        Ok(JsValue::from(n))
-                    } else if v == "true" {
-                        Ok(JsValue::from(true))
-                    } else if v == "false" {
-                        Ok(JsValue::from(false))
-                    } else {
-                        Ok(JsValue::from(js_string!(v.clone())))
-                    }
-                }
+            let stored = shared_get.borrow().global_vars.get(&name).cloned();
+            match stored {
+                Some(v) => json_to_js(&v, ctx),
                 None => Ok(JsValue::undefined()),
             }
         })
@@ -218,4 +178,70 @@ fn build_global_object(
         .build();
 
     Ok(global.into())
+}
+
+/// Convert a JS value into the JSON value stored for a global variable.
+/// Storing the type (rather than a stringified form) is what lets
+/// `client.global.get` round-trip types while `{{var}}` substitution stays plain text.
+fn js_to_json(value: &JsValue, ctx: &mut Context) -> JsResult<serde_json::Value> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    if value.is_boolean() {
+        return Ok(serde_json::Value::Bool(value.to_boolean()));
+    }
+    if value.is_string() {
+        return Ok(serde_json::Value::String(
+            value.to_string(ctx)?.to_std_string_escaped(),
+        ));
+    }
+    if value.is_number() {
+        return Ok(number_to_json(value.to_number(ctx)?));
+    }
+    if value.is_bigint() {
+        // No lossless JSON number for a bigint; keep the exact digits as text.
+        return Ok(serde_json::Value::String(
+            value.to_string(ctx)?.to_std_string_escaped(),
+        ));
+    }
+
+    // Objects and arrays go through JSON.stringify so we inherit JS semantics
+    // (undefined members dropped, `toJSON` honored) instead of hand-rolling them.
+    match json_stringify(value, ctx)? {
+        Some(text) => serde_json::from_str(&text).map_err(|e| {
+            JsNativeError::typ()
+                .with_message(format!("cannot store global variable: {e}"))
+                .into()
+        }),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+/// Whole numbers keep integer form so `{{count}}` renders `12`, not `12.0`.
+/// NaN/Infinity become null, matching `JSON.stringify`.
+fn number_to_json(n: f64) -> serde_json::Value {
+    if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
+        serde_json::Value::from(n as i64)
+    } else {
+        serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, serde_json::Value::Number)
+    }
+}
+
+/// Call the engine's `JSON.stringify`; `None` when it yields `undefined`.
+fn json_stringify(value: &JsValue, ctx: &mut Context) -> JsResult<Option<String>> {
+    let json = ctx.global_object().get(js_string!("JSON"), ctx)?;
+    let stringify = json
+        .as_object()
+        .ok_or_else(|| JsNativeError::typ().with_message("JSON global is not an object"))?
+        .get(js_string!("stringify"), ctx)?;
+    let stringify = stringify
+        .as_callable()
+        .ok_or_else(|| JsNativeError::typ().with_message("JSON.stringify is not callable"))?
+        .clone();
+
+    let result = stringify.call(&JsValue::undefined(), std::slice::from_ref(value), ctx)?;
+    if result.is_undefined() {
+        return Ok(None);
+    }
+    Ok(Some(result.to_string(ctx)?.to_std_string_escaped()))
 }

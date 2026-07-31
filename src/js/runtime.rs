@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use boa_engine::{Context, Source, js_string, property::Attribute};
@@ -8,6 +7,7 @@ use crate::error::AppError;
 use crate::http::HttpResponse;
 use crate::js::client::{JsSharedState, build_client_object};
 use crate::js::response::build_response_object;
+use crate::variable::GlobalVars;
 
 #[derive(Debug, Clone)]
 pub struct TestResult {
@@ -18,7 +18,7 @@ pub struct TestResult {
 
 #[derive(Debug)]
 pub struct HandlerResult {
-    pub global_vars: HashMap<String, String>,
+    pub global_vars: GlobalVars,
     pub test_results: Vec<TestResult>,
     pub log_output: Vec<String>,
 }
@@ -26,7 +26,7 @@ pub struct HandlerResult {
 pub fn execute_handler(
     script: &str,
     http_response: &HttpResponse,
-    existing_globals: &HashMap<String, String>,
+    existing_globals: &GlobalVars,
 ) -> Result<HandlerResult, AppError> {
     let mut context = Context::default();
     let shared_state = Rc::new(RefCell::new(JsSharedState {
@@ -73,6 +73,8 @@ pub fn execute_handler(
 mod tests {
     use super::*;
     use crate::http::{ContentType, HttpResponse};
+    use crate::variable::VariableStore;
+    use std::collections::HashMap;
 
     fn dummy_response() -> HttpResponse {
         HttpResponse {
@@ -94,8 +96,11 @@ mod tests {
         // First handler sets a global variable
         let script1 = r#"client.global.set("totalElements", response.body.totalElements);"#;
         let resp = dummy_response();
-        let result1 = execute_handler(script1, &resp, &HashMap::new()).unwrap();
-        assert_eq!(result1.global_vars.get("totalElements").unwrap(), "12");
+        let result1 = execute_handler(script1, &resp, &GlobalVars::new()).unwrap();
+        assert_eq!(
+            result1.global_vars.get("totalElements").unwrap(),
+            &serde_json::json!(12)
+        );
 
         // Second handler reads the global variable set by the first
         let script2 = r#"
@@ -128,7 +133,7 @@ mod tests {
     #[test]
     fn global_get_preserves_types() {
         let resp = dummy_response();
-        
+
         // Test String
         let script1 = r#"client.global.set("s", "12");"#;
         let result1 = execute_handler(script1, &resp, &HashMap::new()).unwrap();
@@ -140,7 +145,11 @@ mod tests {
             });
         "#;
         let result2 = execute_handler(script2, &resp, &result1.global_vars).unwrap();
-        assert!(result2.test_results.iter().all(|r| r.passed), "String test failed: {:?}", result2.test_results);
+        assert!(
+            result2.test_results.iter().all(|r| r.passed),
+            "String test failed: {:?}",
+            result2.test_results
+        );
 
         // Test Number
         let script3 = r#"client.global.set("n", 12);"#;
@@ -153,7 +162,11 @@ mod tests {
             });
         "#;
         let result4 = execute_handler(script4, &resp, &result3.global_vars).unwrap();
-        assert!(result4.test_results.iter().all(|r| r.passed), "Number test failed: {:?}", result4.test_results);
+        assert!(
+            result4.test_results.iter().all(|r| r.passed),
+            "Number test failed: {:?}",
+            result4.test_results
+        );
 
         // Test Boolean
         let script5 = r#"client.global.set("b", true);"#;
@@ -166,6 +179,75 @@ mod tests {
             });
         "#;
         let result6 = execute_handler(script6, &resp, &result5.global_vars).unwrap();
-        assert!(result6.test_results.iter().all(|r| r.passed), "Boolean test failed: {:?}", result6.test_results);
+        assert!(
+            result6.test_results.iter().all(|r| r.passed),
+            "Boolean test failed: {:?}",
+            result6.test_results
+        );
+    }
+
+    /// Substituting a global set from JS must paste the raw text, never a JSON-quoted form.
+    #[test]
+    fn globals_substitute_without_json_quoting() {
+        let resp = dummy_response();
+        let script = r#"
+            client.global.set("activityTime", "1783554153.000000000");
+            client.global.set("id", 10323);
+            client.global.set("enabled", true);
+        "#;
+        let result = execute_handler(script, &resp, &GlobalVars::new()).unwrap();
+
+        let mut store = VariableStore::new(HashMap::new());
+        store.merge_globals(&result.global_vars);
+
+        let url = store
+            .substitute("/activities/{{id}}?activityTime={{activityTime}}&enabled={{enabled}}")
+            .unwrap();
+        assert_eq!(
+            url,
+            "/activities/10323?activityTime=1783554153.000000000&enabled=true"
+        );
+    }
+
+    /// A response value read as a JS number must not gain a `.0` when substituted.
+    #[test]
+    fn whole_number_global_substitutes_as_integer() {
+        let resp = dummy_response();
+        let script = r#"client.global.set("total", response.body.totalElements);"#;
+        let result = execute_handler(script, &resp, &GlobalVars::new()).unwrap();
+
+        let mut store = VariableStore::new(HashMap::new());
+        store.merge_globals(&result.global_vars);
+
+        assert_eq!(store.substitute("count={{total}}").unwrap(), "count=12");
+    }
+
+    #[test]
+    fn object_global_round_trips_and_substitutes_as_json() {
+        let resp = dummy_response();
+        let script = r#"client.global.set("filter", { name: "cpu", limit: 5 });"#;
+        let result = execute_handler(script, &resp, &GlobalVars::new()).unwrap();
+
+        let script2 = r#"
+            client.test("Object preserved", function() {
+                var v = client.global.get("filter");
+                client.assert(v.name === "cpu", "expected cpu, got " + v.name);
+                client.assert(v.limit === 5, "expected 5, got " + v.limit);
+            });
+        "#;
+        let result2 = execute_handler(script2, &resp, &result.global_vars).unwrap();
+        assert!(
+            result2.test_results.iter().all(|r| r.passed),
+            "Object test failed: {:?}",
+            result2.test_results,
+        );
+
+        let mut store = VariableStore::new(HashMap::new());
+        store.merge_globals(&result.global_vars);
+        let body = store.substitute("{{filter}}").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "name": "cpu", "limit": 5 }),
+        );
     }
 }

@@ -5,13 +5,31 @@ use std::sync::LazyLock;
 
 use crate::error::AppError;
 
-static VARIABLE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
+static VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
+
+/// Globals set from JS handlers. Values keep their JSON type so `client.global.get`
+/// round-trips the original type, while `{{var}}` substitution renders plain text.
+pub type GlobalVars = HashMap<String, serde_json::Value>;
+
+/// Render a global variable as the text pasted into a request.
+/// Strings are inserted verbatim (no JSON quoting); whole numbers keep integer form.
+pub fn render_global(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(f) if f.fract() == 0.0 && f.abs() < i64::MAX as f64 => format!("{}", f as i64),
+            _ => n.to_string(),
+        },
+        other => other.to_string(),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VariableStore {
     env_vars: HashMap<String, String>,
-    global_vars: HashMap<String, String>,
+    global_vars: GlobalVars,
     in_place_vars: HashMap<String, String>,
 }
 
@@ -19,16 +37,16 @@ impl VariableStore {
     pub fn new(env_vars: HashMap<String, String>) -> Self {
         Self {
             env_vars,
-            global_vars: HashMap::new(),
+            global_vars: GlobalVars::new(),
             in_place_vars: HashMap::new(),
         }
     }
 
-    pub fn globals(&self) -> &HashMap<String, String> {
+    pub fn globals(&self) -> &GlobalVars {
         &self.global_vars
     }
 
-    pub fn merge_globals(&mut self, globals: &HashMap<String, String>) {
+    pub fn merge_globals(&mut self, globals: &GlobalVars) {
         for (k, v) in globals {
             self.global_vars.insert(k.clone(), v.clone());
         }
@@ -72,7 +90,7 @@ impl VariableStore {
                     return v.clone();
                 }
                 if let Some(v) = self.global_vars.get(var_name) {
-                    return v.clone();
+                    return render_global(v);
                 }
                 if let Some(v) = self.env_vars.get(var_name) {
                     return v.clone();
