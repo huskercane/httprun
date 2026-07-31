@@ -3,8 +3,9 @@
 ## Project Structure & Module Organization
 - `src/` contains the Rust crate source.
 - `src/main.rs` is the CLI entry point.
-- Core modules live at `src/env.rs`, `src/http.rs`, `src/parser.rs`, `src/variable.rs`, `src/output.rs`, and `src/error.rs`.
+- Core modules live at `src/env.rs`, `src/http.rs`, `src/parser.rs`, `src/variable.rs`, `src/output.rs`, `src/curl.rs`, and `src/error.rs`.
 - JavaScript response handler support lives under `src/js/`.
+- Output adapters live under `src/report/`: the execution loop emits events against the `Reporter` trait and never formats directly.
 - Build artifacts land in `target/` (do not edit or commit).
 
 ## Build, Test, and Development Commands
@@ -20,8 +21,8 @@
 - Keep CLI flags and options consistent with existing Clap usage in `src/main.rs`.
 
 ## Testing Guidelines
-- There are no dedicated automated tests in this repository today.
-- If adding tests, use Rust’s built-in test framework (`#[test]`) and place unit tests near the module they cover (e.g., in `src/parser.rs`).
+- `cargo test` runs the suite; tests live next to the module they cover.
+- Use Rust’s built-in test framework (`#[test]`) and place unit tests near the module they cover (e.g., in `src/parser.rs`).
 - Name tests with clear, behavior-focused phrases (e.g., `parses_request_names`).
 
 ## Commit & Pull Request Guidelines

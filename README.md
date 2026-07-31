@@ -57,6 +57,10 @@ httprun <file.http> [OPTIONS]
 | `--name <name>` | Run a single request by name (case-insensitive substring match) |
 | `--index <n>` | Run a single request by 1-based index |
 | `-v`, `--verbose` | Show a curl-style trace of each request and response |
+| `-q`, `--quiet` | Suppress per-request output; print only failures and the summary |
+| `--format <fmt>` | Output format: `human` (default), `json`, `ndjson` |
+| `-o`, `--output <path>` | Write the report to a file instead of stdout |
+| `--include-secrets` | Do not redact credential headers in `json` / `ndjson` output |
 | `--dry-run` | Parse and display requests without executing them |
 | `--curl` | Print a copy-pasteable `curl` command for each request |
 
@@ -86,7 +90,99 @@ httprun api.http --env dev --dry-run --curl
 
 # Run and also show the equivalent curl command for each request
 httprun api.http --env dev --curl
+
+# Quiet: only failures and the summary (good for CI logs)
+httprun api.http --env dev --quiet
+
+# Machine-readable report for tooling
+httprun api.http --env dev --format json --output report.json
 ```
+
+## Machine-readable output
+
+`--format json` emits a single JSON document describing the whole run;
+`--format ndjson` emits one JSON object per line, flushed as each request
+completes, so a consumer can tail the stream live. Both work with `--dry-run`.
+
+```sh
+# What failed?
+httprun api.http --format json | jq '.requests[] | select(.tests[]? | .passed == false)'
+
+# Status code of every request
+httprun api.http --format json | jq -r '.requests[] | "\(.name): \(.response.status)"'
+
+# Follow a long run as it happens
+httprun api.http --format ndjson | jq -r 'select(.type=="request") | "\(.index) \(.response.status)"'
+```
+
+Document shape:
+
+```json
+{
+  "schemaVersion": 1,
+  "file": "api.http",
+  "environment": "dev",
+  "startedAtMs": 1730000000000,
+  "summary": {
+    "total": 2, "testsPassed": 3, "testsFailed": 0,
+    "errors": 0, "durationMs": 412, "success": true
+  },
+  "requests": [
+    {
+      "index": 1,
+      "name": "login",
+      "method": "POST",
+      "url": "https://api.example.com/auth/login",
+      "headers": { "Authorization": ["<redacted>"] },
+      "body": "{\"username\":\"alice\"}",
+      "response": {
+        "status": 200,
+        "httpVersion": "HTTP/1.1",
+        "headers": { "content-type": ["application/json"] },
+        "body": { "token": "..." },
+        "elapsedMs": 170
+      },
+      "tests": [{ "name": "login returns 200", "passed": true }],
+      "logs": ["token acquired"]
+    }
+  ]
+}
+```
+
+Notes:
+
+- `response.body` is the **parsed JSON value** when the response is JSON, and the raw body as a string otherwise — so `jq .response.body` works either way.
+- `schemaVersion` is bumped when a field is removed or changes meaning. Additive changes keep the same version.
+- In `ndjson`, each request line carries `"type": "request"` and the final line carries `"type": "summary"`.
+- `curl` is only present when `--curl` is passed.
+- Optional fields (`name`, `body`, `curl`, `response`, `error`, `failureMessage`) are omitted when absent rather than emitted as `null`.
+
+### Secret redaction
+
+JSON reports land in files, CI logs and artifact stores, so **credential
+header values are masked by default** — `Authorization`, `Cookie`,
+`Set-Cookie`, `X-API-Key` and friends become `<redacted>` in both the
+`headers` fields and any emitted `curl` command. Pass `--include-secrets` to
+disable this.
+
+Redaction covers headers, **not request bodies** — a login body containing a
+password is still written verbatim, because redacting payloads would gut the
+usefulness of the report. Terminal output is never redacted; it is already
+scoped to whoever ran the command, and `-v` exists precisely to show what went
+on the wire.
+
+## Performance
+
+Requests execute sequentially, so wall-clock time is dominated by network
+round trips, not by printing. Two things still help on large runs:
+
+- Output is written through a large buffer whenever the destination is not a
+  terminal (a pipe, or `--output`), which collapses the many small writes a
+  `-v` run would otherwise make into a handful of syscalls.
+- If a verbose run feels slow interactively, the cost is usually your terminal
+  emulator rendering and scrolling, not httprun. Compare
+  `time httprun f.http -v` against `time httprun f.http -v > /dev/null`; if the
+  gap is large, use `--quiet` or redirect to a file.
 
 ### Debug output
 

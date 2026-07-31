@@ -5,15 +5,32 @@ mod http;
 mod js;
 mod output;
 mod parser;
+mod report;
 mod variable;
 
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::error::AppError;
+use crate::report::{
+    HumanReporter, JsonReporter, JsonStyle, Reporter, RequestReport, RequestResult, RunMeta,
+    Summary,
+};
 use crate::variable::VariableStore;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// Colored, streaming terminal output
+    Human,
+    /// A single JSON document describing the whole run
+    Json,
+    /// One JSON object per line, streamed as each request completes
+    Ndjson,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "httprun", about = "Run IntelliJ .http request files from the terminal")]
@@ -41,6 +58,22 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Suppress per-request output; print only failures and the summary
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    format: Format,
+
+    /// Write the report to a file instead of stdout
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Do not redact credential headers in json/ndjson output
+    #[arg(long)]
+    include_secrets: bool,
+
     /// Parse and display without executing
     #[arg(long)]
     dry_run: bool,
@@ -53,13 +86,83 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    if let Err(e) = run(cli) {
-        output::print_error(&format!("{}", e));
-        process::exit(1);
+    match run(cli) {
+        Ok(code) => process::exit(code),
+        Err(e) => {
+            output::eprint_error(&format!("{}", e));
+            process::exit(1);
+        }
     }
 }
 
-fn run(cli: Cli) -> Result<(), AppError> {
+/// Build the output sink. A terminal keeps line buffering so output streams
+/// live; anything else gets a large buffer, which collapses the ~50 write
+/// syscalls a verbose request would otherwise make into a handful.
+fn build_writer(cli: &Cli) -> Result<(Box<dyn Write>, bool), AppError> {
+    match &cli.output {
+        Some(path) => {
+            let file = std::fs::File::create(path).map_err(|e| {
+                AppError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {}", path.display(), e),
+                ))
+            })?;
+            Ok((Box::new(BufWriter::new(file)), true))
+        }
+        None => {
+            let stdout = std::io::stdout();
+            if stdout.is_terminal() {
+                Ok((Box::new(stdout), false))
+            } else {
+                Ok((Box::new(BufWriter::with_capacity(64 * 1024, stdout)), false))
+            }
+        }
+    }
+}
+
+fn build_reporter(cli: &Cli) -> Result<Box<dyn Reporter>, AppError> {
+    let (writer, to_file) = build_writer(cli)?;
+
+    match cli.format {
+        Format::Human => {
+            // `colored` detects a tty on stdout; it cannot know we redirected
+            // into a file, so suppress escape codes explicitly.
+            if to_file {
+                colored::control::set_override(false);
+            }
+            Ok(Box::new(HumanReporter::new(
+                writer,
+                cli.verbose,
+                cli.curl,
+                cli.quiet,
+            )))
+        }
+        Format::Json | Format::Ndjson => {
+            let style = if cli.format == Format::Json {
+                JsonStyle::Document
+            } else {
+                JsonStyle::Ndjson
+            };
+            let meta = RunMeta {
+                file: cli.file.display().to_string(),
+                environment: cli.env.clone(),
+                started_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+            };
+            Ok(Box::new(JsonReporter::new(
+                writer,
+                style,
+                meta,
+                cli.curl,
+                !cli.include_secrets,
+            )))
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<i32, AppError> {
     // Read and parse the .http file
     let content = std::fs::read_to_string(&cli.file).map_err(|e| {
         AppError::Io(std::io::Error::new(
@@ -72,8 +175,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
     let all_requests = parse_result.requests;
 
     if all_requests.is_empty() {
-        output::print_error("No requests found in file");
-        return Ok(());
+        output::eprint_error("No requests found in file");
+        return Ok(0);
     }
 
     // Load environment variables
@@ -129,101 +232,118 @@ fn run(cli: Cli) -> Result<(), AppError> {
     };
 
     if requests.is_empty() {
-        output::print_error("No matching requests found");
-        return Ok(());
+        output::eprint_error("No matching requests found");
+        return Ok(0);
     }
 
-    // Dry run mode
-    if cli.dry_run {
-        println!(
-            "Dry run: {} request(s) from {}",
-            requests.len(),
-            cli.file.display()
-        );
-        for (i, req) in &requests {
-            let resolved = resolve_request_best_effort(req, &var_store);
-            output::print_dry_run_request(i + 1, &resolved);
-            if cli.curl {
-                output::print_curl_command(&curl::to_curl_command(&resolved));
-            }
-        }
-        return Ok(());
+    let mut reporter = build_reporter(&cli)?;
+
+    let result = if cli.dry_run {
+        dry_run(&cli, &requests, &var_store, reporter.as_mut())
+    } else {
+        execute(&requests, &mut var_store, reporter.as_mut())
+    };
+
+    // Flush unconditionally: `process::exit` skips destructors, so a buffered
+    // writer that is only flushed on the happy path silently loses output.
+    let flushed = reporter.flush();
+    let summary = result?;
+    flushed?;
+
+    Ok(summary.exit_code())
+}
+
+fn dry_run(
+    cli: &Cli,
+    requests: &[(usize, &parser::ParsedRequest)],
+    var_store: &VariableStore,
+    reporter: &mut dyn Reporter,
+) -> Result<Summary, AppError> {
+    reporter.dry_run_started(requests.len(), &cli.file)?;
+
+    for (i, req) in requests {
+        let resolved = resolve_request_best_effort(req, var_store);
+        reporter.dry_run_request(i + 1, &resolved)?;
     }
 
-    // Execute requests
-    let mut passed_tests = 0usize;
-    let mut failed_tests = 0usize;
-    let mut error_count = 0usize;
+    let summary = Summary {
+        total: requests.len(),
+        ..Default::default()
+    };
+    reporter.finish(&summary)?;
+    Ok(summary)
+}
 
-    for (i, req) in &requests {
-        let resolved = resolve_request(req, &var_store)?;
+fn execute(
+    requests: &[(usize, &parser::ParsedRequest)],
+    var_store: &mut VariableStore,
+    reporter: &mut dyn Reporter,
+) -> Result<Summary, AppError> {
+    let started = Instant::now();
+    let mut summary = Summary {
+        total: requests.len(),
+        ..Default::default()
+    };
 
-        output::print_request_header(i + 1, &resolved);
+    for (i, req) in requests {
+        let index = i + 1;
+        let resolved = resolve_request(req, var_store)?;
 
-        if cli.curl {
-            output::print_curl_command(&curl::to_curl_command(&resolved));
-        }
+        reporter.request_started(index, &resolved)?;
 
-        if cli.verbose {
-            output::print_trace_request(&resolved);
-        }
-
-        // Execute HTTP request
         match http::execute_request(&resolved) {
             Ok(response) => {
-                output::print_response_status(&response);
+                let mut logs = Vec::new();
+                let mut tests = Vec::new();
+                let mut handler_error = None;
 
-                if cli.verbose {
-                    output::print_trace_response(&response);
-                }
-
-                // Run response handler if present
                 if let Some(handler) = &resolved.response_handler {
                     match js::execute_handler(handler, &response, var_store.globals()) {
                         Ok(result) => {
-                            // Merge global variables
                             var_store.merge_globals(&result.global_vars);
-
-                            // Print logs
-                            if !result.log_output.is_empty() {
-                                output::print_log_output(&result.log_output);
-                            }
-
-                            // Print test results
-                            if !result.test_results.is_empty() {
-                                output::print_test_results(&result.test_results);
-                                for tr in &result.test_results {
-                                    if tr.passed {
-                                        passed_tests += 1;
-                                    } else {
-                                        failed_tests += 1;
-                                    }
+                            logs = result.log_output;
+                            tests = result.test_results;
+                            for tr in &tests {
+                                if tr.passed {
+                                    summary.tests_passed += 1;
+                                } else {
+                                    summary.tests_failed += 1;
                                 }
                             }
                         }
                         Err(e) => {
-                            output::print_error(&format!("Handler error: {}", e));
-                            error_count += 1;
+                            handler_error = Some(format!("Handler error: {}", e));
+                            summary.errors += 1;
                         }
                     }
                 }
+
+                reporter.request_finished(&RequestReport {
+                    index,
+                    request: &resolved,
+                    result: RequestResult::Completed {
+                        response: &response,
+                        logs: &logs,
+                        tests: &tests,
+                        handler_error: handler_error.as_deref(),
+                    },
+                })?;
             }
             Err(e) => {
-                output::print_error(&format!("{}", e));
-                error_count += 1;
+                summary.errors += 1;
+                let message = e.to_string();
+                reporter.request_finished(&RequestReport {
+                    index,
+                    request: &resolved,
+                    result: RequestResult::Failed(&message),
+                })?;
             }
         }
     }
 
-    // Print summary
-    output::print_summary(requests.len(), passed_tests, failed_tests, error_count);
-
-    // Exit with failure if any tests failed or errors occurred
-    if failed_tests > 0 || error_count > 0 {
-        process::exit(1);
-    }
-
-    Ok(())
+    summary.duration_ms = started.elapsed().as_millis();
+    reporter.finish(&summary)?;
+    Ok(summary)
 }
 
 /// Substitute `{{var}}` references in a request's URL, headers, and body.

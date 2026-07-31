@@ -21,16 +21,17 @@ Rust 1.93+ required (edition 2024).
 
 ## Architecture
 
-**Execution flow:** Parse CLI args → read .http file → parse requests → load environment → for each request: substitute variables → execute HTTP → run JS handler (if present) → print results → exit 0/1.
+**Execution flow:** Parse CLI args → read .http file → parse requests → load environment → build a reporter → for each request: substitute variables → execute HTTP → run JS handler (if present) → emit reporter events → exit 0/1.
 
 **Key modules:**
 - `src/main.rs` — CLI entry point (Clap), orchestrates the pipeline
+- `src/report/` — reporting port (`Reporter` trait) and adapters: `human.rs` (colored streaming terminal output), `json.rs` (json / ndjson for tooling), `redact.rs` (credential masking for machine formats). The execution loop emits events and does no formatting itself; add a new output format here rather than branching in `main.rs`
 - `src/parser.rs` — State-machine parser for `.http` files (states: AwaitingRequest, ReadingHeaders, ReadingBody, ReadingHandler)
 - `src/http.rs` — Blocking reqwest HTTP executor
 - `src/env.rs` — Loads `http-client.env.json` / `http-client.private.env.json`
 - `src/variable.rs` — `{{var}}` substitution with dynamic vars (`$uuid`, `$timestamp`, `$randomInt`); precedence: in-place > global > environment
 - `src/js/` — Boa JS engine integration: `runtime.rs` (executor), `client.rs` (`client.test/assert/log/global`), `response.rs` (response object exposed to handlers)
-- `src/output.rs` — Colored terminal output formatting
+- `src/output.rs` — Terminal formatting primitives; every function writes into a caller-supplied `&mut dyn Write` (never `println!`) so output can be buffered or redirected to a file
 - `src/error.rs` — Centralized `AppError` enum via thiserror
 
 ## Code Style
