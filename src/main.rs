@@ -5,6 +5,7 @@ mod http;
 mod js;
 mod output;
 mod parser;
+mod progress;
 mod report;
 mod variable;
 
@@ -73,6 +74,11 @@ struct Cli {
     /// Do not redact credential headers in json/ndjson output
     #[arg(long)]
     include_secrets: bool,
+
+    /// Do not show the in-flight spinner (it is already off when stderr is
+    /// not a terminal)
+    #[arg(long)]
+    no_progress: bool,
 
     /// Parse and display without executing
     #[arg(long)]
@@ -241,7 +247,12 @@ fn run(cli: Cli) -> Result<i32, AppError> {
     let result = if cli.dry_run {
         dry_run(&cli, &requests, &var_store, reporter.as_mut())
     } else {
-        execute(&requests, &mut var_store, reporter.as_mut())
+        execute(
+            &requests,
+            &mut var_store,
+            reporter.as_mut(),
+            !cli.no_progress,
+        )
     };
 
     // Flush unconditionally: `process::exit` skips destructors, so a buffered
@@ -278,8 +289,10 @@ fn execute(
     requests: &[(usize, &parser::ParsedRequest)],
     var_store: &mut VariableStore,
     reporter: &mut dyn Reporter,
+    progress: bool,
 ) -> Result<Summary, AppError> {
     let started = Instant::now();
+    let spinner_available = progress::is_available(progress);
     let mut summary = Summary {
         total: requests.len(),
         ..Default::default()
@@ -291,7 +304,17 @@ fn execute(
 
         reporter.request_started(index, &resolved)?;
 
-        match http::execute_request(&resolved) {
+        // Spans only the blocking call: the reporter writes nothing between
+        // `request_started` and `request_finished`, so the spinner owns the
+        // terminal for that window and needs no coordination with it.
+        let spinner = progress::Spinner::start(
+            &spinner_label(index, &resolved, spinner_available),
+            progress,
+        );
+        let outcome = http::execute_request(&resolved);
+        spinner.stop();
+
+        match outcome {
             Ok(response) => {
                 let mut logs = Vec::new();
                 let mut tests = Vec::new();
@@ -344,6 +367,19 @@ fn execute(
     summary.duration_ms = started.elapsed().as_millis();
     reporter.finish(&summary)?;
     Ok(summary)
+}
+
+/// Identify the in-flight request. `--quiet` prints no header, so the spinner
+/// is the only place the request is named while it runs. Skipped entirely
+/// when no spinner will be drawn.
+fn spinner_label(index: usize, request: &parser::ParsedRequest, available: bool) -> String {
+    if !available {
+        return String::new();
+    }
+    match &request.name {
+        Some(name) => format!("[{}] {}", index, name),
+        None => format!("[{}] {} {}", index, request.method.as_str(), request.url),
+    }
 }
 
 /// Substitute `{{var}}` references in a request's URL, headers, and body.

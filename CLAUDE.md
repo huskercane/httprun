@@ -31,6 +31,7 @@ Rust 1.93+ required (edition 2024).
 - `src/env.rs` — Loads `http-client.env.json` / `http-client.private.env.json`
 - `src/variable.rs` — `{{var}}` substitution with dynamic vars (`$uuid`, `$timestamp`, `$randomInt`); precedence: in-place > global > environment
 - `src/js/` — Boa JS engine integration: `runtime.rs` (executor), `client.rs` (`client.test/assert/log/global`), `response.rs` (response object exposed to handlers)
+- `src/progress.rs` — In-flight spinner. Draws on stderr only, and only when stderr is a terminal, so stdout stays a clean machine-readable stream. Runs only around the blocking HTTP call, a window in which the reporter writes nothing — keep it that way, or the spinner and reporter will interleave
 - `src/output.rs` — Terminal formatting primitives; every function writes into a caller-supplied `&mut dyn Write` (never `println!`) so output can be buffered or redirected to a file
 - `src/error.rs` — Centralized `AppError` enum via thiserror
 

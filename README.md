@@ -61,6 +61,7 @@ httprun <file.http> [OPTIONS]
 | `--format <fmt>` | Output format: `human` (default), `json`, `ndjson` |
 | `-o`, `--output <path>` | Write the report to a file instead of stdout |
 | `--include-secrets` | Do not redact credential headers in `json` / `ndjson` output |
+| `--no-progress` | Disable the in-flight spinner (already off when stderr is not a terminal) |
 | `--dry-run` | Parse and display requests without executing them |
 | `--curl` | Print a copy-pasteable `curl` command for each request |
 
@@ -170,6 +171,26 @@ password is still written verbatim, because redacting payloads would gut the
 usefulness of the report. Terminal output is never redacted; it is already
 scoped to whoever ran the command, and `-v` exists precisely to show what went
 on the wire.
+
+## Progress
+
+While a request is in flight, httprun shows a spinner with a live elapsed
+counter, so a slow endpoint is distinguishable from a hung one:
+
+```
+[1] fetch report
+  GET https://api.example.com/reports/large
+  ⠹ [1] fetch report 4.2s
+```
+
+The line erases itself when the response arrives. This matters most under
+`--quiet`, which otherwise prints nothing until the run ends.
+
+It draws on **stderr**, so `--format json`, `--output` and pipelines keep a
+clean stdout — `httprun api.http --format json | jq` still shows the spinner
+in your terminal while emitting parseable JSON. When stderr is not a terminal
+(CI, redirected logs) nothing is drawn at all, so there is no escape-code
+noise to strip. Use `--no-progress` to turn it off explicitly.
 
 ## Performance
 
